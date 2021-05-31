@@ -5,6 +5,8 @@ import json
 import socket
 import inspect
 import logging
+from collections.abc import Iterable
+
 import requests
 from asyncio.selector_events import BaseSelectorEventLoop
 from flask_cors import CORS
@@ -85,6 +87,52 @@ class ProxyListener(object):
         return None
 
 
+class Listeners(Iterable):
+    """ Container class for ProxyListener instances. """
+
+    def __init__(self, listeners=None):
+        self.listeners = listeners or list()
+
+    def __iter__(self):
+        return self.listeners.__iter__()
+
+    def __getitem__(self, item):
+        return self.listeners[item]
+
+    def prepend(self, listeners):
+        self.listeners = Listeners.of(listeners).listeners + self.listeners
+        return self
+
+    def append(self, listeners):
+        self.listeners += Listeners.of(listeners).listeners
+        return self
+
+    def contains_listener_type(self, listener_type):
+        return any([isinstance(obj, listener_type)] for obj in self.listeners)
+
+    @staticmethod
+    def of(obj) -> 'Listeners':
+        if not obj:
+            return Listeners()
+        if isinstance(obj, Listeners):
+            return obj
+        if isinstance(obj, Iterable):
+            ls = []
+            for item in obj:
+                if not item:
+                    continue
+                elif isinstance(item, Listeners):
+                    ls.extend(item.listeners)
+                elif isinstance(item, Iterable):
+                    ls.extend(item)
+                else:
+                    ls.append(item)
+
+            return Listeners(ls)
+
+        return Listeners([obj])
+
+
 # -------------------
 # BASE BACKEND UTILS
 # -------------------
@@ -151,8 +199,7 @@ def modify_and_forward(method=None, path=None, data_bytes=None, headers=None, fo
     """ This is the central function that coordinates the incoming/outgoing messages
         with the proxy listeners (message interceptors). """
 
-    listeners = ProxyListener.DEFAULT_LISTENERS + (listeners or [])
-    listeners = [lis for lis in listeners if lis]
+    listeners = Listeners.of(ProxyListener.DEFAULT_LISTENERS).append(listeners)
     data = data_bytes
 
     def is_full_url(url):
@@ -180,8 +227,7 @@ def modify_and_forward(method=None, path=None, data_bytes=None, headers=None, fo
 
     # update listener (pre-invocation)
     for listener in listeners:
-        listener_result = listener.forward_request(method=method,
-            path=path, data=data, headers=headers)
+        listener_result = listener.forward_request(method=method, path=path, data=data, headers=headers)
         if isinstance(listener_result, Response):
             response = listener_result
             break
@@ -223,9 +269,8 @@ def modify_and_forward(method=None, path=None, data_bytes=None, headers=None, fo
 
         # make sure we drop "chunked" transfer encoding from the headers to be forwarded
         headers.pop('Transfer-Encoding', None)
-        requests_method = getattr(requests, method.lower())
-        response = requests_method(request_url, data=data_to_send,
-            headers=headers, stream=True, verify=False)
+        response = requests.request(method, request_url, data=data_to_send, headers=headers,
+            stream=True, verify=False)
 
     # prevent requests from processing response body (e.g., to pass-through gzip encoded content unmodified)
     pass_raw = ((hasattr(response, '_content_consumed') and not response._content_consumed) or
@@ -236,8 +281,7 @@ def modify_and_forward(method=None, path=None, data_bytes=None, headers=None, fo
             response._content = new_content
 
     # update listener (post-invocation)
-    if listeners:
-        update_listener = listeners[-1]
+    for listener in listeners:
         kwargs = {
             'method': method,
             'path': path,
@@ -245,19 +289,18 @@ def modify_and_forward(method=None, path=None, data_bytes=None, headers=None, fo
             'headers': headers,
             'response': response
         }
-        if 'request_handler' in inspect.getargspec(update_listener.return_response)[0]:
+        if 'request_handler' in inspect.getargspec(listener.return_response)[0]:
             # some listeners (e.g., sqs_listener.py) require additional details like the original
             # request port, hence we pass in a reference to this request handler as well.
             kwargs['request_handler'] = request_handler
 
-        updated_response = update_listener.return_response(**kwargs)
+        updated_response = listener.return_response(**kwargs)
         if isinstance(updated_response, Response):
             response = updated_response
 
     # allow pre-flight CORS headers by default
     from localstack.services.s3.s3_listener import ProxyListenerS3
-    is_s3_listener = any([isinstance(service_listener, ProxyListenerS3) for service_listener in listeners])
-    if not is_s3_listener:
+    if not listeners.contains_listener_type(ProxyListenerS3):
         append_cors_headers(response)
 
     return response
@@ -362,7 +405,7 @@ def start_proxy_server(port, forward_url=None, use_ssl=None, update_listener=Non
         request_handler.proxy = Mock()
         request_handler.proxy.port = port
         response = modify_and_forward(method=method, path=path_with_params, data_bytes=data, headers=headers,
-            forward_base_url=forward_url, listeners=[update_listener], request_handler=None,
+            forward_base_url=forward_url, listeners=update_listener, request_handler=None,
             client_address=request.remote_addr, server_address=parsed_url.netloc)
 
         return response
