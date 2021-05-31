@@ -18,7 +18,8 @@ from localstack.services.kinesis import kinesis_listener
 from localstack.services.awslambda import lambda_api
 from localstack.services.apigateway import helpers
 from localstack.services.generic_proxy import ProxyListener
-from localstack.utils.aws.aws_responses import flask_to_requests_response, requests_response, LambdaResponse
+from localstack.utils.aws.aws_responses import flask_to_requests_response, requests_response, LambdaResponse, \
+    set_response_content
 from localstack.services.apigateway.helpers import (get_resource_for_path, handle_authorizers, handle_validators,
     handle_accounts, extract_query_string_params, extract_path_params, make_error_response,
     get_cors_response, hande_base_path_mappings)
@@ -533,5 +534,21 @@ def get_lambda_event_request_context(method, path, data, headers,
     return request_context
 
 
-# instantiate listener
-UPDATE_APIGATEWAY = ProxyListenerApiGateway()
+class ErrorFilter(ProxyListener):
+
+    def return_response(self, method, path, data, headers, response, request_handler=None):
+        if response.ok:
+            return
+
+        # FIXME: this is a hack to get the terraform test suite to run. this assumes that we're dealing with an error as
+        #  it is returned by the moto flask server, which is unexpected behavior. the problem may be that behind an API
+        #  gateway call sits a user app that returns such an error in an expected way.
+        if response._content.startswith(b'<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">'):
+            set_response_content(response, {'errorType': 'ServerError', 'errorMessage': 'unhandled error'})
+            response.headers['Content-Type'] = 'application/json'
+
+        return response
+
+
+# instantiate listeners
+UPDATE_APIGATEWAY = [ErrorFilter(), ProxyListenerApiGateway()]
